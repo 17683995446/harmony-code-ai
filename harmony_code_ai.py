@@ -148,6 +148,59 @@ class ArkTSParser:
     def __init__(self):
         self.files_parsed = 0
         self.errors: List[str] = []
+        
+        # 预编译正则表达式以提高性能
+        self._class_pattern = re.compile(
+            r'^(\s*)'
+            r'((?:@\w+\s*)*)'
+            r'(export\s+)?(default\s+)?(abstract\s+)?'
+            r'(struct|class|interface|enum)\s+(\w+)'
+            r'(\s*<[^>]*>)?'
+            r'(?:\s+extends\s+(\w+))?'
+            r'(?:\s+implements\s+([\w,\s]+))?',
+            re.MULTILINE
+        )
+        
+        self._method_pattern = re.compile(
+            r'(?:^|\n|\}|\{|\;)'
+            r'(\s*)'
+            r'(?:(?:@Builder\s+)?)?'
+            r'((?:(?:async|public|private|protected|static|override|readonly|abstract)\s+)*)'
+            r'(\w+)'
+            r'\s*'
+            r'(?:<[^>]*>)?\s*'
+            r'\(',
+            re.MULTILINE
+        )
+        
+        self._decorator_method_pattern = re.compile(
+            r'(?:^|\n|\}|\{|\;)'
+            r'(\s*)'
+            r'@(\w+)\s*'
+            r'(?:\([^)]*\))?\s*'
+            r'(\w+)'
+            r'\s*'
+            r'(?:<[^>]*>)?\s*'
+            r'\(',
+            re.MULTILINE
+        )
+        
+        self._call_pattern = re.compile(
+            r'(?:(\w+)\s*\.\s*)?(\w+)'
+            r'\s*'
+            r'\(',
+            re.MULTILINE
+        )
+        
+        self._import_pattern = re.compile(
+            r"""^\s*import\s+(?:"""
+            r"""(?:\{([^}]+)\}\s+from\s+)"""  # import { A, B } from 'module'
+            r"""|from\s+)"""                   # import from 'module'
+            r"""["']([^"']+)["']"""            # 'module' 或 "module"
+            r"""|(["'])([^"']+)\3"""           # import 'module' (无 from)
+            r"""$""",
+            re.MULTILINE | re.VERBOSE
+        )
 
     def parse_project(self, project_path: str) -> Tuple[List[ArkClass], List[ArkCall], List[ArkComponent], List[str], List[ArkImport]]:
         """
@@ -218,30 +271,31 @@ class ArkTSParser:
     def _parse_imports(self, content: str) -> List[ArkImport]:
         """解析导入语句"""
         imports = []
-        # import { xxx } from 'module'
-        pattern = r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]"
-        for m in re.finditer(pattern, content):
+        seen_raw = set()
+        # 使用预编译的正则表达式
+        for m in self._import_pattern.finditer(content):
             # 跳过字符串内的匹配
             if self._is_in_string(content, m.start()):
                 continue
-            components = [c.strip() for c in m.group(1).split(',')]
-            imports.append(ArkImport(
-                raw=m.group(0),
-                module=m.group(2),
-                components=components,
-                is_from=True
-            ))
-        # import 'module'
-        pattern2 = r"import\s+['\"]([^'\"]+)['\"]"
-        for m in re.finditer(pattern2, content):
-            # 跳过字符串内的匹配
-            if self._is_in_string(content, m.start()):
+            raw = m.group(0)
+            if raw in seen_raw:
                 continue
-            imports.append(ArkImport(
-                raw=m.group(0),
-                module=m.group(1),
-                is_from=False
-            ))
+            seen_raw.add(raw)
+            # group(1): 花括号内容, group(2): from后的模块名, group(3): 引号字符, group(4): 无from时的模块名
+            if m.group(1) is not None:
+                # import { A, B } from 'module'
+                components_str = m.group(1)
+                components = [c.strip() for c in components_str.split(',')]
+                module = m.group(2)
+                imports.append(ArkImport(raw=raw, module=module, components=components, is_from=True))
+            elif m.group(2):
+                # import from 'module'
+                module = m.group(2)
+                imports.append(ArkImport(raw=raw, module=module, components=[], is_from=True))
+            elif m.group(4):
+                # import 'module'
+                module = m.group(4)
+                imports.append(ArkImport(raw=raw, module=module, components=[], is_from=False))
         return imports
 
     def _is_in_backtick_string(self, content: str, pos: int) -> bool:
@@ -263,30 +317,70 @@ class ArkTSParser:
         """检查给定位置是否在任何字符串内（单引号、双引号、反引号）"""
         if pos < 0 or pos >= len(content):
             return False
+        
+        # 使用缓存避免重复计算
+        cache_key = id(content)
+        if not hasattr(self, '_string_cache'):
+            self._string_cache = {}
+        
+        if cache_key not in self._string_cache:
+            # 预计算所有字符串区域
+            self._string_cache[cache_key] = self._compute_string_regions(content)
+        
+        regions = self._string_cache[cache_key]
+        for start, end in regions:
+            # 引号字符本身不算在字符串内，只有引号之间的内容才算
+            if start < pos < end - 1:
+                return True
+        return False
+    
+    def _compute_string_regions(self, content: str) -> List[Tuple[int, int]]:
+        """预计算所有字符串区域，返回 (start, end) 列表"""
+        regions = []
         i = 0
         in_single = False
         in_double = False
         in_backtick = False
-        while i < pos and i < len(content):
+        string_start = 0
+        
+        while i < len(content):
             ch = content[i]
+            
             if ch == '\\' and (in_single or in_double or in_backtick):
                 i += 2
                 continue
+            
             if not in_single and not in_double and not in_backtick:
                 if ch == "'":
                     in_single = True
+                    string_start = i
                 elif ch == '"':
                     in_double = True
+                    string_start = i
                 elif ch == '`':
                     in_backtick = True
+                    string_start = i
             elif in_single and ch == "'":
                 in_single = False
+                regions.append((string_start, i + 1))
             elif in_double and ch == '"':
                 in_double = False
+                regions.append((string_start, i + 1))
             elif in_backtick and ch == '`':
                 in_backtick = False
+                regions.append((string_start, i + 1))
+            
             i += 1
-        return in_single or in_double or in_backtick
+        
+        # 处理未闭合的字符串
+        if in_single or in_double or in_backtick:
+            regions.append((string_start, len(content)))
+        
+        return regions
+    
+    def clear_string_cache(self):
+        """清除字符串缓存"""
+        self._string_cache = {}
 
     def _parse_file(self, content: str, file_path: str) -> List[ArkClass]:
         """解析单个文件中的所有类/结构体"""
@@ -295,18 +389,8 @@ class ArkTSParser:
 
         # 查找所有 struct/class/interface/enum 定义
         # 支持 @decorator 前缀、export、default、abstract
-        pattern = re.compile(
-            r'^(\s*)'  # 行首空白
-            r'((?:@\w+\s*)*)'  # 可选的装饰器（如 @Component, @Entry 等）
-            r'(export\s+)?(default\s+)?(abstract\s+)?'
-            r'(struct|class|interface|enum)\s+(\w+)'
-            r'(\s*<[^>]*>)?'  # 可选泛型参数 <T> 或 <K, V>
-            r'(?:\s+extends\s+(\w+))?'
-            r'(?:\s+implements\s+([\w,\s]+))?',
-            re.MULTILINE
-        )
-
-        for match in pattern.finditer(content):
+        # 使用预编译的正则表达式
+        for match in self._class_pattern.finditer(content):
             # 跳过字符串内的匹配（反引号模板字符串、单引号、双引号）
             if self._is_in_string(content, match.start()):
                 continue
@@ -468,37 +552,8 @@ class ArkTSParser:
         """解析类体中的方法"""
         methods = []
 
-        # 匹配方法定义（支持 async, public, private, protected, static, override 等修饰符）
-        # 同时支持 @Builder 装饰的方法（如 @Builder MyHeader() { ... }）
-        # 使用 (?:^|\n|\}|\{|\;) 匹配行首、换行后、花括号后或分号后
-        # 添加 \{ 以匹配类体开头的方法（如 "{ method() {}"）
-        pattern = re.compile(
-            r'(?:^|\n|\}|\{|\;)'  # 行首、换行后、花括号后、左花括号后或分号后
-            r'(\s*)'  # 缩进
-            r'(?:(?:@Builder\s+)?)?'  # 可选的 @Builder 装饰器
-            r'((?:(?:async|public|private|protected|static|override|readonly|abstract)\s+)*)'  # 修饰符
-            r'(\w+)'  # 方法名
-            r'\s*'  # 可选空格
-            r'(?:<[^>]*>)?\s*'  # 可选泛型参数 <T> 或 <A, B>
-            r'\(',  # 参数列表开始
-            re.MULTILINE
-        )
-
-        # 第二个正则：匹配带装饰器的方法（如 @Watch('onChange') onChange() { ... }）
-        # 装饰器和方法名在同一行，中间可能有参数
-        decorator_method_pattern = re.compile(
-            r'(?:^|\n|\}|\{|\;)'  # 行首、换行后、花括号后、左花括号后或分号后
-            r'(\s*)'  # 缩进
-            r'@(\w+)\s*'  # 装饰器名 @XXX
-            r'(?:\([^)]*\))?\s*'  # 可选的装饰器参数 (...)
-            r'(\w+)'  # 方法名
-            r'\s*'  # 可选空格
-            r'(?:<[^>]*>)?\s*'  # 可选泛型参数
-            r'\(',  # 参数列表开始
-            re.MULTILINE
-        )
-
-        for match in pattern.finditer(body):
+        # 使用预编译的正则表达式匹配方法定义
+        for match in self._method_pattern.finditer(body):
             # 跳过字符串内的匹配（反引号模板字符串等）
             if self._is_in_string(body, match.start()):
                 continue
@@ -568,7 +623,7 @@ class ArkTSParser:
         # 使用第二个正则匹配带装饰器的方法（如 @Watch('onChange') onChange() { ... }）
         # 这些方法可能被第一个正则漏掉，因为装饰器参数中的括号干扰了匹配
         existing_names = {m.name for m in methods}
-        for match in decorator_method_pattern.finditer(body):
+        for match in self._decorator_method_pattern.finditer(body):
             # 跳过字符串内的匹配
             if self._is_in_string(body, match.start()):
                 continue
@@ -762,7 +817,7 @@ class ArkTSParser:
         pattern = re.compile(
             r'@(?:State|Prop|Provide|Link|Consume|StorageLink|StorageProp|Watch|Builder|BuilderParam|Extend|Styles|ObjectLink|V2)\s*'
             r'(?:\([^)]*\))?\s*'
-            r'(\w+)\s*(?::\s*[\w\[\]|<>=>()\s]+)?\s*(?:[=;\n])'
+            r'(\w+)\s*(?::\s*[\w\[\]|<>=>()\s]+)?\s*(?:[=;\n}])'
         )
         for m in pattern.finditer(body):
             # 跳过字符串内的匹配
@@ -839,12 +894,8 @@ class ArkTSParser:
             # 第二遍：匹配 identifier< 后跟 ( 的模式（含泛型参数，包括嵌套）
             # 第二遍使用手动字符扫描来正确处理嵌套尖括号
 
-            # 第一遍：不含泛型参数的调用
-            call_pattern = re.compile(
-                r'(?:(\w+)\s*\.\s*)?(\w+)'  # 可选对象.方法名
-                r'\s*'
-                r'\('  # 左括号
-            )
+            # 第一遍：不含泛型参数的调用（使用预编译正则）
+            call_pattern = self._call_pattern
 
             seen = set()
 
@@ -867,7 +918,7 @@ class ArkTSParser:
                         return  # 无法找到正确的括号
 
                 # 跳过关键字和内置函数
-                if callee in ('if', 'for', 'while', 'switch', 'catch', 'typeof',
+                skip_callees = ('if', 'for', 'while', 'switch', 'catch', 'typeof',
                               'instanceof', 'new', 'return', 'function',
                               'class', 'import', 'export', 'from', 'const', 'let',
                               'var', 'true', 'false', 'null', 'undefined', 'this',
@@ -875,7 +926,7 @@ class ArkTSParser:
                               'parseFloat', 'String', 'Number', 'Boolean', 'Array',
                               'Object', 'Promise', 'setTimeout', 'setInterval',
                               'clearTimeout', 'clearInterval', 'require',
-                              'Logger', 'hilog', 'setTimeout', 'console',
+                              'Logger', 'hilog',
                               'forEach', 'map', 'filter', 'reduce', 'find',
                               'indexOf', 'includes', 'push', 'pop', 'shift',
                               'slice', 'splice', 'join', 'split', 'replace',
@@ -891,7 +942,12 @@ class ArkTSParser:
                               'justifyContent', 'offset', 'position', 'markAnchor',
                               'bindMenu', 'bindSheet', 'onClick', 'onChange',
                               'onAppear', 'onDisappear', 'onGesture', 'animation',
-                              'transition', 'id', 'tag', 'key'):
+                              'transition', 'id', 'tag', 'key')
+                skip_objs = ('console', 'Math', 'JSON', 'Promise', 'setTimeout',
+                            'setInterval', 'clearTimeout', 'clearInterval',
+                            'Logger', 'hilog', 'parseInt', 'parseFloat',
+                            'String', 'Number', 'Boolean', 'Array', 'Object')
+                if callee in skip_callees or (obj and obj in skip_objs):
                     return
 
                 # 跳过 ArkUI 组件名
@@ -1374,7 +1430,7 @@ class SQLValidator:
         if not sql or not sql.strip():
             return False, "SQL为空"
 
-        cleaned = sql.strip().rstrip(';').strip()
+        cleaned = sql.strip()
 
         # 先移除注释，再检查前缀
         # 移除单行注释 --
@@ -1383,7 +1439,7 @@ class SQLValidator:
         no_comment = re.sub(r'/\*.*?\*/', '', no_comment, flags=re.DOTALL)
         no_comment = no_comment.strip()
 
-        # 检查前缀（移除注释后）
+        # 检查前缀（移除注释后，转大写比较）
         first_word = no_comment.split()[0].upper() if no_comment.split() else ""
         if first_word not in cls.ALLOWED_PREFIXES:
             return False, f"只允许只读查询(SELECT/WITH/EXPLAIN)，检测到: {first_word}"
@@ -1392,14 +1448,10 @@ class SQLValidator:
         # 移除字符串后检查是否还有分号
         no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", no_comment)
         no_strings = re.sub(r'"(?:[^"\\]|\\.)*"', '""', no_strings)
-        # 移除SQL关键字后的内容，检查剩余部分是否包含分号
-        # 简单检查：如果移除第一个语句后还有非空内容，说明是多语句
         semicolon_count = no_strings.count(';')
         if semicolon_count > 0:
-            # 检查分号后是否还有有效SQL（不只是空白）
-            after_first = no_strings.split(';', 1)[1] if ';' in no_strings else ""
-            if after_first.strip():
-                return False, "SQL中包含多个语句，不允许执行"
+            # 任何分号都视为多语句风险（注释注入场景）
+            return False, "SQL中包含分号，可能存在多语句注入"
 
         # 检查禁止关键字（不区分大小写）
         upper_sql = no_strings.upper()
